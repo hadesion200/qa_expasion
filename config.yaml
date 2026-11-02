@@ -1,0 +1,104 @@
+# =============================================================================
+# 查询扩写数据集工作流配置
+#
+# 流程：模型一扩写 user query -> 模型二回答（含思维链）-> 模型三判断正确性
+#      -> 过滤/格式校验/查重 -> outputs/<数据集名>_expanded.jsonl
+#
+# 最终 JSONL 每行严格为 5 个字段，与 datasets/TX-CW-self-cognition.jsonl 一致：
+#   {"multiturn": false, "tool": false, "id": "...", "category": "...", "messages": [...]}
+#   不输出评分、来源、参考答案等额外字段。
+#
+# 运行：
+#   sh run.sh --mock --fresh     # 内置 mock，调试全流程
+#   sh run.sh --fresh            # 真实模型
+#   sh run.sh                    # 断点续跑
+#
+# 调试参数：
+#   dataset.max_source_records   源问题总数上限（0=不限）
+#   expansion.multiplier         每个源问题扩写倍数
+#   expansion.target_total       扩写总量上限（0=不限，按倍数自动计算）
+#   runtime.*_workers            三个阶段各自的并发数
+# =============================================================================
+
+paths:
+  # 平行目录 self-cognition-WorkFlow 里的原始 jsonl
+  # 如果要换数据集，改这里即可
+  data_dir: ../self-cognition-WorkFlow/datasets
+  # 中间结果：queries/answers/judged（全部在本文件夹内）
+  work_dir: ./work
+  # 最终新数据集：<数据集名>_expanded.jsonl
+  output_dir: ./outputs
+
+dataset:
+  dedupe: true                 # 源问题按文件内问题文本去重
+  require_reference: true      # 没有 assistant 参考答案的记录跳过
+  min_question_chars: 1
+  max_source_records: 0        # 调试用：最多取多少个源问题，0=不限
+
+expansion:
+  multiplier: 3                # 每个源问题扩写几条
+  target_total: 0              # 扩写总量上限，0=按 multiplier 自动计算
+  min_query_chars: 4
+  max_query_chars: 500
+
+export:
+  min_correctness: 0.7         # 低于该分数不写入最终数据集
+  require_keep: true           # 还要求模型三 keep=true
+  skip_source_duplicates: true # 扩写后与原问题相同则丢弃
+
+model_expander:
+  mode: api                    # api | mock
+  name: expander
+  base_url: http://127.0.0.1:8000/v1
+  api_key: ""
+  api_key_env: EXPANDER_API_KEY
+  model: expander-model
+  temperature: 0.9
+  top_p: null
+  max_tokens: 2048
+  timeout: 180
+  max_retries: 3
+  extra_body: {}
+  drop_keys: []
+
+model_answerer:
+  mode: api
+  name: answerer
+  base_url: http://127.0.0.1:8001/v1
+  api_key: ""
+  api_key_env: ANSWERER_API_KEY
+  model: answerer-model
+  temperature: 0.7
+  top_p: null
+  max_tokens: 8192
+  timeout: 180
+  max_retries: 3
+  extra_body: {}
+  drop_keys: []
+
+model_judge:
+  mode: api
+  name: judge
+  # 示例沿用上一工作流的 Moonshot 配置；按实际评审模型修改
+  base_url: https://api.moonshot.cn/v1
+  api_key: ""
+  api_key_env: MOONSHOT_API_KEY
+  model: kimi-k2.6
+  temperature: 1               # kimi-k2.6 只接受 1
+  top_p: null
+  max_tokens: 4096
+  timeout: 180
+  max_retries: 3
+  extra_body: {}
+  drop_keys: []
+
+runtime:
+  expand_workers: 4            # 模型一并发
+  answer_workers: 8            # 模型二并发
+  judge_workers: 8             # 模型三并发
+  max_context_chars: 16000
+  request_interval_sec: 0.0
+  fsync_every: 1
+  progress_interval_sec: 0.2
+  retry_failed: true
+  mock_delay_ms: 30
