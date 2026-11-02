@@ -4,6 +4,9 @@
 # 流程：模型一扩写 user query -> 模型二回答（含思维链）-> 模型三判断正确性
 #      -> 过滤/格式校验/查重 -> outputs/<数据集名>_expanded.jsonl
 #
+# 模型一只做同义改写或中英文互译，不改变原意；
+# 模型二会收到“源答案（已去除思维链）”作为系统提示中的参考信息，以提高正确率。
+#
 # 最终 JSONL 每行严格为 5 个字段，与 datasets/TX-CW-self-cognition.jsonl 一致：
 #   {"multiturn": false, "tool": false, "id": "...", "category": "...", "messages": [...]}
 #   不输出评分、来源、参考答案等额外字段。
@@ -36,10 +39,16 @@ dataset:
   max_source_records: 0        # 调试用：最多取多少个源问题，0=不限
 
 expansion:
-  multiplier: 3                # 每个源问题扩写几条
+  multiplier: 3                # 每个源问题扩写几条（只做同义改写/中英文互译）
   target_total: 0              # 扩写总量上限，0=按 multiplier 自动计算
   min_query_chars: 4
   max_query_chars: 500
+
+answer:
+  # 模型二提问时，把源答案（已去除思维链）作为系统提示中的参考答案喂入
+  include_reference: true
+  # 是否同时保留源数据的 system prompt
+  include_source_system: true
 
 export:
   min_correctness: 0.7         # 低于该分数不写入最终数据集

@@ -65,6 +65,10 @@ DEFAULTS: dict[str, Any] = {
         "min_query_chars": 4,
         "max_query_chars": 500,
     },
+    "answer": {
+        "include_source_system": True,
+        "include_reference": True,
+    },
     "export": {
         "min_correctness": 0.7,
         "require_keep": True,
@@ -396,38 +400,56 @@ def reset_generated(cfg: dict, stage: str) -> None:
 # ---------------------------------------------------------------------------
 
 def build_expand_messages(cfg: dict, source: dict, count: int) -> list[dict]:
-    max_chars = int(cfg["runtime"].get("max_context_chars") or 16000)
-    reference = C.clip(source.get("reference_answer") or "", max(800, max_chars // 3))
-    system = """你是一名严谨的问答数据扩写专家。
-你的任务不是回答问题，而是把给定的原问题改写成若干条语义等价、表达不同的独立用户提问。
+    system = """你是一名严格的用户问题改写器。
+你的任务不是回答问题，而是把原问题改写成若干条“同义但问法不同”的独立用户提问。
 
-要求：
-1. 保持原问题的核心意图、事实约束、限定条件和语言（中文问题用中文改写，英文问题用英文改写）。
-2. 每条改写都必须是完整、可独立作答的用户问题，不能依赖上下文。
-3. 不得改变原问题的结论方向，不得加入参考答案中的答案内容，不得给出答案。
-4. 不同改写之间要有明显措辞或视角差异，避免只替换个别同义词。
-5. 不要输出编号、解释、Markdown 代码块或多余文字。
+只允许做两类改动：
+1. 同义改写：换句式、同义词、主动/被动、口语/书面语，但语义完全不变。
+2. 中英文互译：中文问题可以改写成英文，英文问题可以改写成中文。
+
+严格禁止：
+- 增加或删除任何事实、条件、前提、范围、限定词、时间、对象。
+- 改变问题的结论方向、提问角度或专业领域。
+- 引入参考答案中的答案内容，或把答案写进问题。
+- 添加“从原理角度”“从工程角度”“请分三点”等新的约束或视角。
+- 回答原问题，或输出与问题无关的内容。
+
+每条改写必须是完整、可独立作答的用户问题；不同改写之间只改变措辞或语言，不改变含义。
+不要输出编号、解释、Markdown 代码块或多余文字。
 
 只输出一个 JSON 对象：
 {"queries": ["第一条改写", "第二条改写"]}"""
     user = f"""【原问题】
 {source.get('question', '')}
 
-【参考答案（仅用于理解知识点，不要复制进问题）】
-{reference or '（无）'}
-
 【需要生成的数量】
 {count}
 
-请生成 {count} 条改写，并只输出 JSON。"""
+请只做同义改写或中英文互译，生成 {count} 条，并只输出 JSON。"""
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
 def build_answer_messages(cfg: dict, query_record: dict, expanded_query: str) -> list[dict]:
-    messages: list[dict] = []
+    options = cfg.get("answer") or {}
+    max_chars = int(cfg["runtime"].get("max_context_chars") or 16000)
+    parts: list[str] = []
+
     system_prompt = str(query_record.get("system_prompt") or "").strip()
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
+    if options.get("include_source_system", True) and system_prompt:
+        parts.append(system_prompt)
+
+    reference = str(query_record.get("reference_answer") or "").strip()
+    if options.get("include_reference", True) and reference:
+        reference = C.clip(reference, max(800, max_chars // 2))
+        parts.append(
+            "下面给出本题的参考答案。它可能不完整，请以它为主要事实依据来回答用户问题；\n"
+            "不要提及“参考答案”“提示”等字样，也不要把这段说明复述给用户。\n\n"
+            f"【参考答案】\n{reference}"
+        )
+
+    messages: list[dict] = []
+    if parts:
+        messages.append({"role": "system", "content": "\n\n".join(parts)})
     messages.append({"role": "user", "content": expanded_query})
     return messages
 
@@ -743,32 +765,49 @@ def extract_cot_text(content: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _mock_expand(prompt: str) -> str:
-    match = re.search(r"【原问题】\n(.*?)(?:\n\n【参考答案|\n\n【需要生成的数量】)", prompt, re.S)
+    match = re.search(r"【原问题】\n(.*?)(?:\n\n【需要生成的数量】)", prompt, re.S)
     question = match.group(1).strip() if match else prompt.strip()
     count_match = re.search(r"【需要生成的数量】\s*(\d+)", prompt)
     count = int(count_match.group(1)) if count_match else 1
 
-    templates = [
-        "请从基本原理出发，解释：{q}",
-        "关于「{q}」，请给出一个准确、简洁的回答。",
-        "如果从工程应用的角度看，{q} 应该如何理解？",
-        "请说明这个问题的关键要点：{q}",
-        "换一种说法：{q}，请给出你的结论。",
-    ]
+    if re.search(r"[\u4e00-\u9fff]", question):
+        templates = [
+            "请回答：{q}",
+            "我想了解：{q}",
+            "能否说明一下：{q}",
+            "关于「{q}」，请给出你的答案。",
+            "请解释这个问题：{q}",
+        ]
+    else:
+        templates = [
+            "Please answer: {q}",
+            "I would like to know: {q}",
+            "Could you explain: {q}",
+            "Regarding \"{q}\", please give your answer.",
+            "Please clarify this question: {q}",
+        ]
     variants = [templates[index % len(templates)].format(q=question) for index in range(count)]
     if count >= 2 and int(C.sha1_text(question)[:2], 16) % 3 == 0:
         variants[-1] = variants[0]  # 故意制造重复，验证扩写去重
     return json.dumps({"queries": variants}, ensure_ascii=False)
 
 
-def _mock_answer(prompt: str) -> tuple[str, str]:
+def _mock_answer(prompt: str, system: str = "") -> tuple[str, str]:
     query = prompt.strip()
+    reference_match = re.search(r"【参考答案】\n(.*)$", system or "", re.S)
+    reference = reference_match.group(1).strip() if reference_match else ""
     digest = C.sha1_text("mock-answer", query)
-    reasoning = f"模拟推理：需要围绕「{C.clip(query, 50)}」拆解概念、前提和结论，注意不要脱离问题范围。"
-    final = (
-        "（模拟回答）这个问题可以从定义、关键参数和应用场景三个方面理解。"
-        f"核心结论需要结合具体条件判断。问题摘要：{C.clip(query, 60)}"
-    )
+
+    if reference:
+        final = C.clip(reference, 900)
+        reasoning = "模拟推理：提示中已给出参考答案，按其事实组织最终回答，不改变结论。"
+    else:
+        final = (
+            "（模拟回答）这个问题可以从定义、关键参数和应用场景三个方面理解。"
+            f"核心结论需要结合具体条件判断。问题摘要：{C.clip(query, 60)}"
+        )
+        reasoning = f"模拟推理：需要围绕「{C.clip(query, 50)}」拆解概念、前提和结论。"
+
     if int(digest[:2], 16) % 2 == 0:
         return f"<think>\n{reasoning}\n</think>\n\n{final}", ""
     return final, reasoning
@@ -776,22 +815,31 @@ def _mock_answer(prompt: str) -> tuple[str, str]:
 
 def _mock_judge(prompt: str) -> str:
     match = re.search(
-        r"【原问题】\n.*?\n\n【参考答案】\n.*?\n\n【扩写后的问题】\n(.*?)\n\n【模型最终回答】\n(.*?)\n\n【模型思维链",
+        r"【原问题】\n.*?\n\n【参考答案】\n(.*?)\n\n【扩写后的问题】\n(.*?)\n\n【模型最终回答】\n(.*?)\n\n【模型思维链",
         prompt,
         re.S,
     )
-    expanded = match.group(1).strip() if match else prompt
-    final = match.group(2).strip() if match else ""
+    reference = match.group(1).strip() if match else ""
+    expanded = match.group(2).strip() if match else prompt
+    final = match.group(3).strip() if match else ""
     threshold_match = re.search(r"通过阈值\s*([0-9.]+)", prompt)
     threshold = float(threshold_match.group(1)) if threshold_match else 0.7
 
     if not final or final.startswith("（无最终回答）"):
         return json.dumps({"correctness": 0.0, "keep": False, "reason": "没有最终回答。"}, ensure_ascii=False)
 
-    digest = C.sha1_text("mock-correctness", expanded, final)
-    score = round(0.35 + (int(digest[:6], 16) % 601) / 1000.0, 2)
-    keep = score >= threshold
-    reason = "模拟评审：回答覆盖了基本要点。" if keep else "模拟评审：回答与参考答案的要点对应不足。"
+    if reference and (
+        C.normalize_for_key(reference) in C.normalize_for_key(final)
+        or C.normalize_for_key(final) in C.normalize_for_key(reference)
+    ):
+        score = 0.95
+        keep = True
+        reason = "模拟评审：最终回答与参考答案一致。"
+    else:
+        digest = C.sha1_text("mock-correctness", expanded, final)
+        score = round(0.35 + (int(digest[:6], 16) % 601) / 1000.0, 2)
+        keep = score >= threshold
+        reason = "模拟评审：回答覆盖了基本要点。" if keep else "模拟评审：回答与参考答案的要点对应不足。"
     return json.dumps({"correctness": score, "keep": keep, "reason": reason}, ensure_ascii=False)
 
 
@@ -800,12 +848,13 @@ def _mock_chat(model_cfg: dict, messages: list[dict], purpose: str, runtime: dic
     if delay:
         time.sleep(random.uniform(delay * 0.5, delay * 1.5))
     prompt = messages[-1]["content"] if messages else ""
+    system = "\n\n".join(str(item.get("content") or "") for item in messages if item.get("role") == "system")
     content = ""
     reasoning = ""
     if purpose == "expand":
         content = _mock_expand(prompt)
     elif purpose == "answer":
-        content, reasoning = _mock_answer(prompt)
+        content, reasoning = _mock_answer(prompt, system)
     elif purpose == "judge":
         content = _mock_judge(prompt)
     else:
@@ -841,9 +890,8 @@ def expand_hash(cfg: dict, source: dict, count: int) -> str:
             {
                 "model": _model_fingerprint(cfg["model_expander"]),
                 "question": source.get("question"),
-                "reference": source.get("reference_answer"),
                 "count": count,
-                "prompt_version": 1,
+                "prompt_version": 2,
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -858,7 +906,10 @@ def answer_hash(cfg: dict, query_record: dict, expanded_query: str) -> str:
                 "model": _model_fingerprint(cfg["model_answerer"]),
                 "query": expanded_query,
                 "system": query_record.get("system_prompt") or "",
-                "prompt_version": 1,
+                "reference": query_record.get("reference_answer") or "",
+                "include_reference": bool(cfg.get("answer", {}).get("include_reference", True)),
+                "include_source_system": bool(cfg.get("answer", {}).get("include_source_system", True)),
+                "prompt_version": 2,
             },
             ensure_ascii=False,
             sort_keys=True,
